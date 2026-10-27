@@ -69,3 +69,25 @@ or cookies. The password field is cleared after each attempt. No broker secrets
 are embedded in the page. JavaScript is required; without it submission is blocked
 by the page's Content Security Policy. This is a publish test client, not a subscriber.
 Run `php tests/client.php` to verify the HTTPS gate and independent HTTP routing.
+
+## Security boundary
+
+Request parameters are data: they never select PHP includes, filesystem paths,
+shell commands or the broker address. The configured broker alone is contacted;
+its ACLs determine which topics each supplied MQTT user may publish to. Payloads
+are length-framed MQTT bytes, not executed by the bridge. Downstream consumers
+must independently validate the messages they act on.
+
+The client renders results as text, has no external assets and uses a restrictive
+Content Security Policy. HTTP responses do not reflect payloads or credentials.
+Messages exceeding the MQTT client's 1 MiB packet limit are rejected before connecting.
+Tests can only run from the command line.
+
+This source review found no request-controlled code execution, file access or
+arbitrary destination in the bridge. It is not a guarantee about PHP, the web
+server or their deployment. Concurrent requests can still exhaust workers while
+waiting for the broker; use web-server request/concurrency limits appropriate to
+the deployment. Keep configuration/backups and .git inaccessible over HTTP,
+disable production display_errors and avoid query-string logging for credential
+URLs. Plain HTTP credentials and GET-triggered publishing are accepted constraints
+of the intended trusted-network use, not protections against hostile networks.

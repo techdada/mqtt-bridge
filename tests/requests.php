@@ -1,4 +1,5 @@
 <?php
+if (PHP_SAPI !== 'cli') { http_response_code(404); exit; }
 error_reporting(E_ALL);
 set_error_handler(function ($level, $message, $file, $line) {
     throw new ErrorException($message, 0, $level, $file, $line);
@@ -53,6 +54,13 @@ $b = request(array_merge($base, array('topic'=>'room name')));
 checkRequest($b->sent[0] === 'room_name', 'Legacy topic spaces');
 $b = request(array_merge($base, array('topic'=>'room name','allow_spaces'=>'')));
 checkRequest($b->sent[0] === 'room name', 'Explicit topic spaces');
+foreach (array('<?php system("id"); ?>', '$(id); cat /etc/passwd', '../../config.php',
+    "\r\nSet-Cookie: injected=1", '<img src=x onerror=alert(1)>') as $payload) {
+    $b = request($base + array('value'=>$payload));
+    checkRequest($b->status === 200 && $b->sent[1] === $payload && $b->response === 'Published', 'Payload was interpreted or reflected');
+}
+$b = request($base + array('value'=>str_repeat('x',1048576)));
+checkRequest($b->status === 413 && $b->sent === null, 'Oversized message reached broker');
 class TransportBridge extends MQTTBridgeController {
     public static $broker;
     protected function mqtt() { return self::$broker; }

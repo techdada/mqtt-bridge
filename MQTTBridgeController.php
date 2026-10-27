@@ -33,6 +33,11 @@ class MQTTBridgeController
             if (strlen($user) > 65535 || preg_match('//u', $user) !== 1 || strpos($user, "\0") !== false
                 || strlen($pass) > 65535) throw new InvalidArgumentException('Invalid broker credentials');
             $value = $this->parameter('value');
+            // Match the MQTT client's packet limit before connecting or copying a large payload.
+            if (strlen($value) + strlen($topic) + 4 > 1048576) {
+                $this->respond(413, 'Message exceeds 1 MiB packet limit');
+                return;
+            }
             if (isset($_GET['valuets']) || isset($_POST['valuets'])) {
                 $this->parameter('valuets');
                 if ($value === '') $value = gmdate('Y-m-d H:i:s e');

@@ -1,4 +1,5 @@
 <?php
+if (PHP_SAPI !== 'cli') { http_response_code(404); exit; }
 // Local protocol regression tests; no broker, packages or credentials required.
 require __DIR__ . '/../lib/phpMQTT.php';
 

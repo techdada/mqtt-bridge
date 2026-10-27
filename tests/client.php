@@ -1,4 +1,5 @@
 <?php
+if (PHP_SAPI !== 'cli') { http_response_code(404); exit; }
 error_reporting(E_ALL);
 set_error_handler(function ($level, $message, $file, $line) {
     throw new ErrorException($message, 0, $level, $file, $line);
