@@ -3,423 +3,460 @@
 namespace techdada;
 
 /*
- 	phpMQTT
-	A simple php class to connect/publish/subscribe to an MQTT broker
-
-*/
-
-/*
-	Licence
-
-	Copyright (c) 2010 Blue Rhinos Consulting | Andrew Milsted
-	andrew@bluerhinos.co.uk | http://www.bluerhinos.co.uk
-
-	Permission is hereby granted, free of charge, to any person obtaining a copy
-	of this software and associated documentation files (the "Software"), to deal
-	in the Software without restriction, including without limitation the rights
-	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-	copies of the Software, and to permit persons to whom the Software is
-	furnished to do so, subject to the following conditions:
-
-	The above copyright notice and this permission notice shall be included in
-	all copies or substantial portions of the Software.
-
-	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-	THE SOFTWARE.
-	
-*/
-
-/* phpMQTT */
-class phpMQTT {
-
-	private $socket; 			/* holds the socket	*/
-	private $msgid = 1;			/* counter for message id */
-	public $keepalive = 10;		/* default keepalive timmer */
-	public $timesinceping;		/* host unix time, used to detect disconects */
-	public $topics = array(); 	/* used to store currently subscribed topics */
-	public $debug = false;		/* should output debug messages */
-	public $address;			/* broker address */
-	public $port;				/* broker port */
-	public $clientid;			/* client id sent to brocker */
-	public $will;				/* stores the will of the client */
-	private $username;			/* stores username */
-	private $password;			/* stores password */
-	private $tls_prot;			/* stores tls protocol to use */
-
-	public $cafile;
-
-	function __construct($address, $port, $clientid, $cafile = NULL, $tls_prot = 'tls'){
-		$this->broker($address, $port, $clientid, $cafile, $tls_prot);
-	}
-
-	/* sets the broker details */
-	function broker($address, $port, $clientid, $cafile = NULL, $tls_prot = 'tls' ){
-		$this->address = $address;
-		$this->port = $port;
-		$this->clientid = $clientid;
-		$this->cafile = $cafile;
-		$this->tls_prot = $tls_prot;
-	}
-
-	function connect_auto($clean = true, $will = NULL, $username = NULL, $password = NULL){
-		while($this->connect($clean, $will, $username, $password)==false){
-			sleep(10);
-		}
-		return true;
-	}
-
-	/* connects to the broker 
-		inputs: $clean: should the client send a clean session flag */
-	function connect($clean = true, $will = NULL, $username = NULL, $password = NULL){
-		
-		if($will) $this->will = $will;
-		if($username) $this->username = $username;
-		if($password) $this->password = $password;
-
-
-		if ($this->cafile) {
-			$socketContext = stream_context_create(["ssl" => [
-				"verify_peer_name" => true,
-				"cafile" => $this->cafile
-				]]);
-			$this->socket = stream_socket_client($this->tls_prot . "://" . $this->address . ":" . $this->port, $errno, $errstr, 60, STREAM_CLIENT_CONNECT, $socketContext);
-		} else {
-			$this->socket = stream_socket_client("tcp://" . $this->address . ":" . $this->port, $errno, $errstr, 60, STREAM_CLIENT_CONNECT);
-		}
-
-		if (!$this->socket ) {
-		    if($this->debug) error_log("stream_socket_create() $errno, $errstr \n");
-			return false;
-		}
-
-		stream_set_timeout($this->socket, 5);
-		stream_set_blocking($this->socket, 0);
-
-		$i = 0;
-		$buffer = "";
-
-		$buffer .= chr(0x00); $i++;
-		$buffer .= chr(0x06); $i++;
-		$buffer .= chr(0x4d); $i++;
-		$buffer .= chr(0x51); $i++;
-		$buffer .= chr(0x49); $i++;
-		$buffer .= chr(0x73); $i++;
-		$buffer .= chr(0x64); $i++;
-		$buffer .= chr(0x70); $i++;
-		$buffer .= chr(0x03); $i++;
-
-		//No Will
-		$var = 0;
-		if($clean) $var+=2;
-
-		//Add will info to header
-		if($this->will != NULL){
-			$var += 4; // Set will flag
-			$var += ($this->will['qos'] << 3); //Set will qos
-			if($this->will['retain'])	$var += 32; //Set will retain
-		}
-
-		if($this->username != NULL) $var += 128;	//Add username to header
-		if($this->password != NULL) $var += 64;	//Add password to header
-
-		$buffer .= chr($var); $i++;
-
-		//Keep alive
-		$buffer .= chr($this->keepalive >> 8); $i++;
-		$buffer .= chr($this->keepalive & 0xff); $i++;
-
-		$buffer .= $this->strwritestring($this->clientid,$i);
-
-		//Adding will to payload
-		if($this->will != NULL){
-			$buffer .= $this->strwritestring($this->will['topic'],$i);  
-			$buffer .= $this->strwritestring($this->will['content'],$i);
-		}
-
-		if($this->username) $buffer .= $this->strwritestring($this->username,$i);
-		if($this->password) $buffer .= $this->strwritestring($this->password,$i);
-
-		$head = "  ";
-		$head{0} = chr(0x10);
-		$head{1} = chr($i);
-
-		fwrite($this->socket, $head, 2);
-		fwrite($this->socket,  $buffer);
-
-	 	$string = $this->read(4);
-
-		if(ord($string{0})>>4 == 2 && $string{3} == chr(0)){
-			if($this->debug) echo "Connected to Broker\n"; 
-		}else{	
-			error_log(sprintf("Connection failed! (Error: 0x%02x 0x%02x)\n", 
-			                        ord($string{0}),ord($string{3})));
-			return false;
-		}
-
-		$this->timesinceping = time();
-
-		return true;
-	}
-
-	/* read: reads in so many bytes */
-	function read($int = 8192, $nb = false){
-
-		//	print_r(socket_get_status($this->socket));
-		
-		$string="";
-		$togo = $int;
-		
-		if($nb){
-			return fread($this->socket, $togo);
-		}
-			
-		while (!feof($this->socket) && $togo>0) {
-			$fread = fread($this->socket, $togo);
-			$string .= $fread;
-			$togo = $int - strlen($string);
-		}
-		
-	
-		
-		
-			return $string;
-	}
-
-	/* subscribe: subscribes to topics */
-	function subscribe($topics, $qos = 0){
-		$i = 0;
-		$buffer = "";
-		$id = $this->msgid;
-		$buffer .= chr($id >> 8);  $i++;
-		$buffer .= chr($id % 256);  $i++;
-
-		foreach($topics as $key => $topic){
-			$buffer .= $this->strwritestring($key,$i);
-			$buffer .= chr($topic["qos"]);  $i++;
-			$this->topics[$key] = $topic; 
-		}
-
-		$cmd = 0x80;
-		//$qos
-		$cmd +=	($qos << 1);
-
-
-		$head = chr($cmd);
-		$head .= chr($i);
-		
-		fwrite($this->socket, $head, 2);
-		fwrite($this->socket, $buffer, $i);
-		$string = $this->read(2);
-		
-		$bytes = ord(substr($string,1,1));
-		$string = $this->read($bytes);
-	}
-
-	/* ping: sends a keep alive ping */
-	function ping(){
-			$head = " ";
-			$head = chr(0xc0);		
-			$head .= chr(0x00);
-			fwrite($this->socket, $head, 2);
-			if($this->debug) echo "ping sent\n";
-	}
-
-	/* disconnect: sends a proper disconect cmd */
-	function disconnect(){
-			$head = " ";
-			$head{0} = chr(0xe0);		
-			$head{1} = chr(0x00);
-			fwrite($this->socket, $head, 2);
-	}
-
-	/* close: sends a proper disconect, then closes the socket */
-	function close(){
-	 	$this->disconnect();
-		stream_socket_shutdown($this->socket, STREAM_SHUT_WR);	
-	}
-
-	/* publish: publishes $content on a $topic */
-	function publish($topic, $content, $qos = 0, $retain = 0){
-
-		$i = 0;
-		$buffer = "";
-
-		$buffer .= $this->strwritestring($topic,$i);
-
-		//$buffer .= $this->strwritestring($content,$i);
-
-		if($qos){
-			$id = $this->msgid++;
-			$buffer .= chr($id >> 8);  $i++;
-		 	$buffer .= chr($id % 256);  $i++;
-		}
-
-		$buffer .= $content;
-		$i+=strlen($content);
-
-
-		$head = " ";
-		$cmd = 0x30;
-		if($qos) $cmd += $qos << 1;
-		if($retain) $cmd += 1;
-
-		$head{0} = chr($cmd);		
-		$head .= $this->setmsglength($i);
-
-		fwrite($this->socket, $head, strlen($head));
-		fwrite($this->socket, $buffer, $i);
-
-	}
-
-	/* message: processes a recieved topic */
-	function message($msg){
-		 	$tlen = (ord($msg{0})<<8) + ord($msg{1});
-			$topic = substr($msg,2,$tlen);
-			$msg = substr($msg,($tlen+2));
-			$found = 0;
-			foreach($this->topics as $key=>$top){
-				if( preg_match("/^".str_replace("#",".*",
-						str_replace("+","[^\/]*",
-							str_replace("/","\/",
-								str_replace("$",'\$',
-									$key))))."$/",$topic) ){
-					if(is_callable($top['function'])){
-						call_user_func($top['function'],$topic,$msg);
-						$found = 1;
-					}
-				}
-			}
-
-			if($this->debug && !$found) echo "msg recieved but no match in subscriptions\n";
-	}
-
-	/* proc: the processing loop for an "allways on" client 
-		set true when you are doing other stuff in the loop good for watching something else at the same time */	
-	function proc( $loop = true){
-
-		if(1){
-			$sockets = array($this->socket);
-			$w = $e = NULL;
-			$cmd = 0;
-			
-				//$byte = fgetc($this->socket);
-			if(feof($this->socket)){
-				if($this->debug) echo "eof receive going to reconnect for good measure\n";
-				fclose($this->socket);
-				$this->connect_auto(false);
-				if(count($this->topics))
-					$this->subscribe($this->topics);	
-			}
-			
-			$byte = $this->read(1, true);
-			
-			if(!strlen($byte)){
-				if($loop){
-					usleep(100000);
-				}
-			 
-			}else{ 
-			
-				$cmd = (int)(ord($byte)/16);
-				if($this->debug) echo "Recevid: $cmd\n";
-
-				$multiplier = 1; 
-				$value = 0;
-				do{
-					$digit = ord($this->read(1));
-					$value += ($digit & 127) * $multiplier; 
-					$multiplier *= 128;
-					}while (($digit & 128) != 0);
-
-				if($this->debug) echo "Fetching: $value\n";
-				
-				if($value)
-					$string = $this->read($value);
-				
-				if($cmd){
-					switch($cmd){
-						case 3:
-							$this->message($string);
-						break;
-					}
-
-					$this->timesinceping = time();
-				}
-			}
-
-			if($this->timesinceping < (time() - $this->keepalive )){
-				if($this->debug) echo "not found something so ping\n";
-				$this->ping();	
-			}
-			
-
-			if($this->timesinceping<(time()-($this->keepalive*2))){
-				if($this->debug) echo "not seen a package in a while, disconnecting\n";
-				fclose($this->socket);
-				$this->connect_auto(false);
-				if(count($this->topics))
-					$this->subscribe($this->topics);
-			}
-
-		}
-		return 1;
-	}
-
-	/* getmsglength: */
-	function getmsglength(&$msg, &$i){
-
-		$multiplier = 1; 
-		$value = 0 ;
-		do{
-		  $digit = ord($msg{$i});
-		  $value += ($digit & 127) * $multiplier; 
-		  $multiplier *= 128;
-		  $i++;
-		}while (($digit & 128) != 0);
-
-		return $value;
-	}
-
-
-	/* setmsglength: */
-	function setmsglength($len){
-		$string = "";
-		do{
-		  $digit = $len % 128;
-		  $len = $len >> 7;
-		  // if there are more digits to encode, set the top bit of this digit
-		  if ( $len > 0 )
-		    $digit = ($digit | 0x80);
-		  $string .= chr($digit);
-		}while ( $len > 0 );
-		return $string;
-	}
-
-	/* strwritestring: writes a string to a buffer */
-	function strwritestring($str, &$i){
-		$ret = " ";
-		$len = strlen($str);
-		$msb = $len >> 8;
-		$lsb = $len % 256;
-		$ret = chr($msb);
-		$ret .= chr($lsb);
-		$ret .= $str;
-		$i += ($len+2);
-		return $ret;
-	}
-
-	function printstr($string){
-		$strlen = strlen($string);
-			for($j=0;$j<$strlen;$j++){
-				$num = ord($string{$j});
-				if($num > 31) 
-					$chr = $string{$j}; else $chr = " ";
-				printf("%4d: %08b : 0x%02x : %s \n",$j,$num,$num,$chr);
-			}
-	}
+ * phpMQTT - a small MQTT 3.1.1 client, using PHP streams only.
+ * Supports publishing/subscribing at QoS 0 and 1. QoS 2 is rejected.
+ * QoS 1 publish() waits for PUBACK. A timeout means delivery is unknown;
+ * the caller may retry, but duplicates are possible. No durable outbox.
+ *
+ * Copyright (c) 2010 Blue Rhinos Consulting | Andrew Milsted
+ * andrew@bluerhinos.co.uk | http://www.bluerhinos.co.uk
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+class phpMQTT
+{
+    private $socket;
+    private $msgid = 1;
+    private $keepalive = 60;
+    private $lastWrite = 0;
+    private $pingSent;
+    private $username;
+    private $password;
+    private $tls_prot;
+    private $topichistory = array();
+    private $waiting = false;
+    private $clean = true;
+    public $topics = array();
+    public $debug = false;
+    public $address;
+    public $port;
+    public $clientid;
+    public $will;
+    public $cafile;
+    public $timeout = 5;
+    public $connectTimeout = 10;
+    public $maxPacketSize = 1048576;
+    public $lastError = '';
+
+    // TLS: true/'tls' permits TLS 1.2/1.3, 'tlsv1.2' pins 1.2.
+    // false/null/''/'tcp'/'plain' disables TLS, independently of cafile.
+    function __construct($address, $port, $clientid, $cafile = null, $tls_prot = 'tls', $debug = false)
+    {
+        $this->broker($address, $port, $clientid, $cafile, $tls_prot, $debug);
+    }
+
+    function broker($address, $port, $clientid, $cafile = null, $tls_prot = 'tls', $debug = false)
+    {
+        $this->address = $address;
+        $this->port = $port;
+        $this->clientid = $clientid;
+        $this->cafile = $cafile;
+        $this->tls_prot = $tls_prot;
+        $this->debug = $debug;
+    }
+
+    function getsocket() { return $this->socket; }
+
+    private function drop()
+    {
+        if (is_resource($this->socket)) fclose($this->socket);
+        $this->socket = null;
+        $this->pingSent = null;
+    }
+
+    private function fail($message)
+    {
+        $this->lastError = $message;
+        if ($this->debug) error_log('MQTT: ' . $message);
+        $this->drop();
+        return false;
+    }
+
+    private function validString($value, $empty = true)
+    {
+        return is_string($value) && ($empty || $value !== '') && strlen($value) <= 65535
+            && preg_match('//u', $value) === 1
+            && strpos($value, "\x00") === false;
+    }
+
+    private function validTopic($topic)
+    {
+        return $this->validString($topic, false) && strpbrk($topic, '+#') === false;
+    }
+
+    private function qos($qos)
+    {
+        if (!in_array($qos, array(0, 1, '0', '1'), true)) {
+            throw new \InvalidArgumentException('Only MQTT QoS 0 and 1 are supported.');
+        }
+        return (int)$qos;
+    }
+
+    private function nextId()
+    {
+        $id = $this->msgid;
+        $this->msgid = $id === 65535 ? 1 : $id + 1;
+        return $id;
+    }
+
+    function connect_auto($clean = true, $will = null, $username = null, $password = null)
+    {
+        while (!$this->connect($clean, $will, $username, $password)) sleep(10);
+        return true;
+    }
+
+    function connect($clean = true, $will = null, $username = null, $password = null)
+    {
+        $this->drop();
+        $this->lastError = '';
+        $this->clean = (bool)$clean;
+        // Omitted arguments preserve credentials and will during reconnect.
+        if (func_num_args() >= 2) $this->will = $will;
+        if (func_num_args() >= 3) $this->username = $username;
+        if (func_num_args() >= 4) $this->password = $password;
+        if (!$this->validString($this->clientid, false)) {
+            throw new \InvalidArgumentException('Invalid MQTT client ID.');
+        }
+        $flags = $clean ? 2 : 0;
+        $i = 0;
+        $payload = $this->strwritestring($this->clientid, $i);
+        if ($this->will !== null) {
+            if (!isset($this->will['topic'], $this->will['content'], $this->will['qos'], $this->will['retain'])
+                || !$this->validTopic($this->will['topic']) || !is_string($this->will['content'])
+                || strlen($this->will['content']) > 65535) {
+                throw new \InvalidArgumentException('Invalid MQTT will.');
+            }
+            $flags |= 4 | ($this->qos($this->will['qos']) << 3) | ($this->will['retain'] ? 32 : 0);
+            $payload .= $this->strwritestring($this->will['topic'], $i)
+                . $this->strwritestring($this->will['content'], $i);
+        }
+        if ($this->username !== null && $this->username !== false) {
+            if (!$this->validString($this->username)) throw new \InvalidArgumentException('Invalid MQTT username.');
+            $flags |= 128;
+            $payload .= $this->strwritestring($this->username, $i);
+            if ($this->password !== null && $this->password !== false) {
+                if (!is_string($this->password) || strlen($this->password) > 65535) {
+                    throw new \InvalidArgumentException('Invalid MQTT password.');
+                }
+                $flags |= 64;
+                $payload .= $this->strwritestring($this->password, $i);
+            }
+        } elseif ($this->password !== null && $this->password !== false) {
+            throw new \InvalidArgumentException('MQTT password requires a username.');
+        }
+        $mode = $this->tls_prot === true ? 'tls' : strtolower((string)$this->tls_prot);
+        $ssl = array('verify_peer' => true, 'verify_peer_name' => true);
+        if (in_array($mode, array('', '0', 'false', 'tcp', 'plain'), true)) {
+            $transport = 'tcp';
+        } else {
+            $transport = 'tls';
+            if ($mode === 'tls' || $mode === '1' || $mode === 'true') {
+                $method = STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT;
+                if (defined('STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT')) $method |= constant('STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT');
+            } elseif ($mode === 'tlsv1.2') {
+                $method = STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT;
+            } elseif ($mode === 'tlsv1.3' && defined('STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT')) {
+                $method = constant('STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT');
+            } else {
+                throw new \InvalidArgumentException('Unsupported TLS mode: ' . $mode);
+            }
+            $ssl['crypto_method'] = $method;
+            if ($this->cafile) $ssl['cafile'] = $this->cafile;
+        }
+        $this->socket = @stream_socket_client($transport . '://' . $this->address . ':' . $this->port,
+            $errno, $errstr, $this->connectTimeout, STREAM_CLIENT_CONNECT,
+            stream_context_create(array('ssl' => $ssl)));
+        if (!$this->socket) return $this->fail('Connection failed: ' . $errno . ' ' . $errstr);
+        stream_set_blocking($this->socket, false);
+        $body = "\x00\x04MQTT\x04" . chr($flags) . pack('n', $this->keepalive) . $payload;
+        if (!$this->send(0x10, $body)) return false;
+        $packet = $this->packet(microtime(true) + $this->timeout);
+        if ($packet === false) return false;
+        if ($packet[0] !== 0x20 || strlen($packet[1]) !== 2 || ord($packet[1][0]) > 1
+            || ($clean && ord($packet[1][0]) !== 0) || ord($packet[1][1]) !== 0) {
+            return $this->fail('Invalid or refused CONNACK: ' . bin2hex($packet[1]));
+        }
+        foreach ($this->topichistory as $topic => $value) {
+            if ($value['retain'] && !$this->publish($topic, $value['msg'], $value['qos'], true)) return false;
+        }
+        return true;
+    }
+
+    // One deadline covers a complete operation, including fragmented packets.
+    private function readExact($count, $deadline)
+    {
+        $data = '';
+        while (strlen($data) < $count) {
+            if (!is_resource($this->socket)) return false;
+            $chunk = @fread($this->socket, $count - strlen($data));
+            if ($chunk === false || ($chunk === '' && feof($this->socket))) return $this->fail('Connection closed while reading.');
+            $data .= $chunk;
+            if (strlen($data) === $count) break;
+            if (microtime(true) >= $deadline) return $this->fail('Read timeout.');
+            if ($chunk === '') usleep(1000);
+        }
+        return $data;
+    }
+
+    function read($int = 8192, $nb = false)
+    {
+        if ($int < 0) throw new \InvalidArgumentException('Negative read length.');
+        if (!is_resource($this->socket)) return false;
+        if ($int === 0) return '';
+        if (!$nb) return $this->readExact($int, microtime(true) + $this->timeout);
+        $data = @fread($this->socket, $int);
+        if ($data === false || ($data === '' && feof($this->socket))) return $this->fail('Connection closed.');
+        return $data;
+    }
+
+    private function send($header, $body)
+    {
+        if (!is_resource($this->socket)) return $this->fail('Not connected.');
+        if (strlen($body) > $this->maxPacketSize) return $this->fail('Packet exceeds configured size limit.');
+        $data = chr($header) . $this->setmsglength(strlen($body)) . $body;
+        $offset = 0;
+        $deadline = microtime(true) + $this->timeout;
+        while ($offset < strlen($data)) {
+            $written = @fwrite($this->socket, substr($data, $offset));
+            if ($written === false || feof($this->socket)) return $this->fail('Write failed.');
+            $offset += $written;
+            if ($offset === strlen($data)) break;
+            if (microtime(true) >= $deadline) return $this->fail('Write timeout.');
+            if ($written === 0) usleep(1000);
+        }
+        $this->lastWrite = microtime(true);
+        return true;
+    }
+
+    private function packet($deadline, $first = null)
+    {
+        if ($first === null) $first = $this->readExact(1, $deadline);
+        if ($first === false) return false;
+        $length = 0;
+        $multiplier = 1;
+        for ($n = 0; $n < 4; $n++) {
+            $byte = $this->readExact(1, $deadline);
+            if ($byte === false) return false;
+            $digit = ord($byte);
+            $length += ($digit & 127) * $multiplier;
+            if ($length > $this->maxPacketSize) return $this->fail('Incoming packet too large.');
+            if (!($digit & 128)) {
+                if ($n > 0 && ($digit & 127) === 0) return $this->fail('Non-canonical packet length.');
+                $body = $this->readExact($length, $deadline);
+                return $body === false ? false : array(ord($first), $body);
+            }
+            $multiplier *= 128;
+        }
+        return $this->fail('Malformed packet length.');
+    }
+
+    private function waitAck($header, $id)
+    {
+        if ($this->waiting) throw new \LogicException('Nested MQTT acknowledgement wait.');
+        $this->waiting = true;
+        $deadline = microtime(true) + $this->timeout;
+        try {
+            do {
+                $packet = $this->packet($deadline);
+                if ($packet === false) return false;
+                if ($packet[0] === $header) {
+                    $body = $packet[1];
+                    $length = $header === 0x40 ? 2 : 3;
+                    if (strlen($body) !== $length || unpack('nid', substr($body, 0, 2))['id'] !== $id) {
+                        return $this->fail('Invalid acknowledgement or packet identifier.');
+                    }
+                    return $body;
+                }
+                if (!$this->handle($packet)) return false;
+            } while (microtime(true) < $deadline);
+            return $this->fail('Acknowledgement timeout.');
+        } finally {
+            $this->waiting = false;
+        }
+    }
+
+    function publish($topic, $content, $qos = 0, $retain = 0)
+    {
+        $qos = $this->qos($qos);
+        if ($qos && $this->waiting) throw new \LogicException('QoS 1 publish inside an acknowledgement callback is not supported.');
+        if (!$this->validTopic($topic) || (!is_scalar($content) && $content !== null)) {
+            throw new \InvalidArgumentException('Invalid publish topic or payload.');
+        }
+        $content = (string)$content;
+        $i = 0;
+        $body = $this->strwritestring($topic, $i);
+        if ($qos) {
+            $id = $this->nextId();
+            $body .= pack('n', $id);
+        }
+        if (!$this->send(0x30 | ($qos << 1) | ($retain ? 1 : 0), $body . $content)) return false;
+        if ($qos && $this->waitAck(0x40, $id) === false) return false;
+        // Cache only successful sends, so a failed send can be retried.
+        $this->topichistory[$topic] = array('msg' => $content, 'qos' => $qos, 'retain' => (bool)$retain);
+        return true;
+    }
+
+    function publishwhenchanged($topic, $msg, $qos = 0, $retain = 0)
+    {
+        $qos = $this->qos($qos);
+        $value = array('msg' => (string)$msg, 'qos' => $qos, 'retain' => (bool)$retain);
+        if (isset($this->topichistory[$topic]) && $this->topichistory[$topic] === $value) return true;
+        return $this->publish($topic, $msg, $qos, $retain);
+    }
+
+    function subscribe($topics, $qos = 0)
+    {
+        if ($this->waiting) throw new \LogicException('Subscribe inside an acknowledgement callback is not supported.');
+        foreach ($topics as $filter => $topic) {
+            if (!$this->validString($filter, false) || preg_match('/(?:[^\/]#|#.+|[^\/]\+|\+[^\/])/', $filter)
+                || !isset($topic['qos'], $topic['function']) || !is_callable($topic['function'])) {
+                throw new \InvalidArgumentException('Invalid subscription.');
+            }
+            $requested = $this->qos($topic['qos']);
+            $id = $this->nextId();
+            $i = 0;
+            if (!$this->send(0x82, pack('n', $id) . $this->strwritestring($filter, $i) . chr($requested))) return false;
+            // Brokers may send matching PUBLISH packets before SUBACK.
+            $this->topics[$filter] = $topic;
+            $ack = $this->waitAck(0x90, $id);
+            if ($ack === false) return false;
+            if (ord($ack[2]) > $requested) return $this->fail('Subscription refused or invalid granted QoS.');
+        }
+        return true;
+    }
+
+    function message($msg)
+    {
+        if (strlen($msg) < 2) return $this->fail('Truncated publish topic.');
+        $length = unpack('nlength', substr($msg, 0, 2))['length'];
+        $topic = substr($msg, 2, $length);
+        if (strlen($msg) < 2 + $length || !$this->validTopic($topic)) return $this->fail('Invalid publish topic.');
+        $payload = substr($msg, 2 + $length);
+        foreach ($this->topics as $filter => $subscription) {
+            if ($topic[0] === '$' && $filter[0] !== '$') continue;
+            $parts = explode('/', $filter);
+            $levels = explode('/', $topic);
+            $match = true;
+            foreach ($parts as $n => $part) {
+                if ($part === '#') break;
+                if (!isset($levels[$n]) || ($part !== '+' && $part !== $levels[$n])) { $match = false; break; }
+            }
+            if ($match && (end($parts) === '#' || count($parts) === count($levels))) {
+                call_user_func($subscription['function'], $topic, $payload);
+            }
+        }
+        return true;
+    }
+
+    private function handle($packet)
+    {
+        list($header, $body) = $packet;
+        if ($header === 0xd0 && $body === '' && $this->pingSent !== null) {
+            $this->pingSent = null;
+            return true;
+        }
+        if (($header >> 4) !== 3) return $this->fail('Unexpected MQTT packet: ' . dechex($header));
+        $qos = ($header >> 1) & 3;
+        if ($qos > 1 || (!$qos && ($header & 8)) || strlen($body) < 2) return $this->fail('Invalid/unsupported PUBLISH flags.');
+        $length = unpack('nlength', substr($body, 0, 2))['length'];
+        if ($qos) {
+            if (strlen($body) < 2 + $length + 2) return $this->fail('Missing publish packet identifier.');
+            $id = substr($body, 2 + $length, 2);
+            if ($id === "\x00\x00") return $this->fail('Zero packet identifier.');
+            $body = substr($body, 0, 2 + $length) . substr($body, 4 + $length);
+        }
+        if (!$this->message($body)) return false;
+        return !$qos || $this->send(0x40, $id);
+    }
+
+    function ping()
+    {
+        if (!$this->send(0xc0, '')) return false;
+        if ($this->pingSent === null) $this->pingSent = microtime(true);
+        return true;
+    }
+
+    function proc($loop = true)
+    {
+        if (!is_resource($this->socket) || feof($this->socket)) {
+            $topics = $this->topics;
+            if (!$this->connect($this->clean) || ($topics && !$this->subscribe($topics))) return false;
+        }
+        $first = $this->read(1, true);
+        if ($first === false) return false;
+        if ($first !== '') {
+            $packet = $this->packet(microtime(true) + $this->timeout, $first);
+            if ($packet === false || !$this->handle($packet)) return false;
+        } elseif ($loop) usleep(100000);
+        $now = microtime(true);
+        if ($this->pingSent !== null && $now - $this->pingSent >= $this->timeout) return $this->fail('PINGRESP timeout.');
+        if ($this->pingSent === null && $now - $this->lastWrite >= $this->keepalive) return $this->ping();
+        return true;
+    }
+
+    function disconnect() { return $this->send(0xe0, ''); }
+
+    function close()
+    {
+        $ok = !is_resource($this->socket) || $this->disconnect();
+        $this->drop();
+        return $ok;
+    }
+
+    function getmsglength(&$msg, &$i)
+    {
+        $length = 0;
+        $multiplier = 1;
+        for ($n = 0; $n < 4 && isset($msg[$i]); $n++) {
+            $digit = ord($msg[$i++]);
+            $length += ($digit & 127) * $multiplier;
+            if (!($digit & 128)) return $length;
+            $multiplier *= 128;
+        }
+        throw new \InvalidArgumentException('Malformed MQTT length.');
+    }
+
+    function setmsglength($len)
+    {
+        if ($len < 0 || $len > 268435455) throw new \InvalidArgumentException('Invalid MQTT length.');
+        $result = '';
+        do {
+            $digit = $len & 127;
+            $len >>= 7;
+            $result .= chr($digit | ($len ? 128 : 0));
+        } while ($len);
+        return $result;
+    }
+
+    function strwritestring($str, &$i)
+    {
+        $len = strlen($str);
+        if ($len > 65535) throw new \InvalidArgumentException('MQTT string too long.');
+        $i += $len + 2;
+        return pack('n', $len) . $str;
+    }
+
+    function printstr($string)
+    {
+        for ($j = 0; $j < strlen($string); $j++) {
+            $num = ord($string[$j]);
+            printf("%4d: %08b : 0x%02x : %s\n", $j, $num, $num, $num > 31 ? $string[$j] : ' ');
+        }
+    }
 }
