@@ -53,6 +53,7 @@ class phpMQTT
     public $connectTimeout = 10;
     public $maxPacketSize = 1048576;
     public $lastError = '';
+    public $historyLimit = 256;
 
     // TLS: true/'tls' permits TLS 1.2/1.3, 'tlsv1.2' pins 1.2.
     // false/null/''/'tcp'/'plain' disables TLS, independently of cafile.
@@ -78,6 +79,7 @@ class phpMQTT
         if (is_resource($this->socket)) fclose($this->socket);
         $this->socket = null;
         $this->pingSent = null;
+        $this->topichistory = array();
     }
 
     private function fail($message)
@@ -192,9 +194,6 @@ class phpMQTT
             || ($clean && ord($packet[1][0]) !== 0) || ord($packet[1][1]) !== 0) {
             return $this->fail('Invalid or refused CONNACK: ' . bin2hex($packet[1]));
         }
-        foreach ($this->topichistory as $topic => $value) {
-            if ($value['retain'] && !$this->publish($topic, $value['msg'], $value['qos'], true)) return false;
-        }
         return true;
     }
 
@@ -308,14 +307,18 @@ class phpMQTT
         if (!$this->send(0x30 | ($qos << 1) | ($retain ? 1 : 0), $body . $content)) return false;
         if ($qos && $this->waitAck(0x40, $id) === false) return false;
         // Cache only successful sends, so a failed send can be retried.
-        $this->topichistory[$topic] = array('msg' => $content, 'qos' => $qos, 'retain' => (bool)$retain);
+        if ($this->historyLimit > 0) {
+            unset($this->topichistory[$topic]);
+            if (count($this->topichistory) >= $this->historyLimit) unset($this->topichistory[array_key_first($this->topichistory)]);
+            $this->topichistory[$topic] = hash('sha256', $qos.':'.(int)(bool)$retain.':'.$content);
+        } else $this->topichistory = array();
         return true;
     }
 
     function publishwhenchanged($topic, $msg, $qos = 0, $retain = 0)
     {
         $qos = $this->qos($qos);
-        $value = array('msg' => (string)$msg, 'qos' => $qos, 'retain' => (bool)$retain);
+        $value = hash('sha256', $qos.':'.(int)(bool)$retain.':'.(string)$msg);
         if (isset($this->topichistory[$topic]) && $this->topichistory[$topic] === $value) return true;
         return $this->publish($topic, $msg, $qos, $retain);
     }
@@ -392,9 +395,10 @@ class phpMQTT
         return true;
     }
 
-    function proc($loop = true)
+    function proc($loop = true, $reconnect = true)
     {
         if (!is_resource($this->socket) || feof($this->socket)) {
+            if (!$reconnect) return $this->fail('MQTT socket closed.');
             $topics = $this->topics;
             if (!$this->connect($this->clean) || ($topics && !$this->subscribe($topics))) return false;
         }
